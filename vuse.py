@@ -9,6 +9,7 @@ Commands
 --------
   vuse watch      run in foreground: scan → connect → stream puffs → DB
   vuse calibrate  discover target device and save its UUID to config.toml
+  vuse analyze    daily-glance summary (today vs 7-day baseline + hour pattern)
   vuse puffs      list stored puffs
   vuse status     last-known daemon state (DB read)
   vuse export     dump DB to CSV
@@ -584,6 +585,156 @@ def cmd_watch(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_analyze(args: argparse.Namespace) -> int:
+    """Print a daily-glance summary: today vs rolling 7-day baseline, hour
+    pattern, last puff, current pod. Read-only — no BLE, no writes."""
+    c = db_connect()
+    now_ts = int(time.time())
+    today_midnight = dt.datetime.now().astimezone().replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    today_start = int(today_midnight.timestamp())
+    yesterday_start = today_start - 86400
+    week_start = today_start - 7 * 86400
+
+    # Today: puffs between local midnight and now
+    today_rows = c.execute(
+        "SELECT puff_id, ts_absolute, duration_ms FROM puffs "
+        "WHERE ts_absolute >= ? ORDER BY puff_id",
+        (today_start,),
+    ).fetchall()
+    today_count = len(today_rows)
+    today_duration_s = sum(r[2] for r in today_rows) / 1000.0
+
+    # Yesterday (previous calendar day)
+    yday_count = c.execute(
+        "SELECT COUNT(*) FROM puffs WHERE ts_absolute >= ? AND ts_absolute < ?",
+        (yesterday_start, today_start),
+    ).fetchone()[0]
+
+    # Baseline: last 7 calendar days BEFORE today. Denominator is 7 days
+    # (fixed), so vacation/skipped days correctly drag the avg down.
+    baseline_sum = c.execute(
+        "SELECT COUNT(*) FROM puffs WHERE ts_absolute >= ? AND ts_absolute < ?",
+        (week_start, today_start),
+    ).fetchone()[0]
+    baseline_days_active = c.execute(
+        "SELECT COUNT(DISTINCT strftime('%Y-%m-%d', ts_absolute, 'unixepoch', 'localtime')) "
+        "FROM puffs WHERE ts_absolute >= ? AND ts_absolute < ?",
+        (week_start, today_start),
+    ).fetchone()[0]
+
+    # Today's hour histogram (local time)
+    today_by_hour = c.execute(
+        "SELECT CAST(strftime('%H', ts_absolute, 'unixepoch', 'localtime') AS INT) AS h, "
+        "       COUNT(*) FROM puffs WHERE ts_absolute >= ? GROUP BY h",
+        (today_start,),
+    ).fetchall()
+    hours = [0] * 24
+    for h, n in today_by_hour:
+        hours[h] = n
+
+    # Most recent puff (across all time)
+    last = c.execute(
+        "SELECT puff_id, ts_absolute, duration_ms, pod_uid FROM puffs "
+        "WHERE ts_absolute IS NOT NULL ORDER BY ts_absolute DESC LIMIT 1",
+    ).fetchone()
+
+    # Current pod (pod of the most recent puff) + how much it's been used
+    current_pod_puffs = 0
+    pod_opened_ts = None
+    if last and last[3]:
+        current_pod_puffs, pod_opened_ts = c.execute(
+            "SELECT COUNT(*), MIN(ts_absolute) FROM puffs WHERE pod_uid = ?",
+            (last[3],),
+        ).fetchone()
+
+    # ── formatting helpers ──
+    def fmt_hms(seconds: float) -> str:
+        s = int(round(seconds))
+        h, rem = divmod(s, 3600)
+        m, sec = divmod(rem, 60)
+        if h:   return f"{h}h{m:02d}m{sec:02d}s"
+        if m:   return f"{m}m{sec:02d}s"
+        return f"{sec}s"
+
+    def fmt_ago(ts: Optional[int]) -> str:
+        if ts is None:
+            return "?"
+        delta = now_ts - int(ts)
+        if delta < 60:    return f"{delta}s ago"
+        if delta < 3600:  return f"{delta // 60} min ago"
+        if delta < 86400: return f"{delta // 3600}h{(delta % 3600) // 60:02d}m ago"
+        return f"{delta // 86400}d ago"
+
+    def sparkline(counts: list[int]) -> str:
+        """Render 24 hour-counts as a compact bar strip using Unicode blocks."""
+        blocks = "▁▂▃▄▅▆▇█"
+        mx = max(counts)
+        if mx == 0:
+            return "·" * 24
+        out = []
+        for n in counts:
+            if n == 0:
+                out.append("·")
+            else:
+                idx = min(len(blocks) - 1, round((n - 1) * (len(blocks) - 1) / max(1, mx - 1)))
+                out.append(blocks[idx])
+        return "".join(out)
+
+    # ── render ──
+    print("=== vuse analyze ===\n")
+
+    # Today
+    if today_count == 0:
+        print("Today          no puffs yet")
+    else:
+        id_range = (f"#{today_rows[0][0]} → #{today_rows[-1][0]}"
+                    if today_rows[0][0] != today_rows[-1][0]
+                    else f"#{today_rows[0][0]}")
+        print(f"Today          {today_count} puffs  ·  "
+              f"{fmt_hms(today_duration_s)} inhaled  ·  {id_range}")
+
+    # Baseline comparison
+    if baseline_days_active < 3:
+        need = 3 - baseline_days_active
+        noun = "day" if need == 1 else "days"
+        print(f"7-day avg      (need {need} more {noun} of history "
+              f"for a reliable baseline)")
+    else:
+        baseline_avg = baseline_sum / 7.0
+        delta_pct = ((today_count - baseline_avg) / baseline_avg * 100
+                     if baseline_avg > 0 else 0)
+        arrow = "↑" if delta_pct > 1 else "↓" if delta_pct < -1 else "="
+        word = "above" if delta_pct > 1 else "below" if delta_pct < -1 else "at"
+        hint = (f" [{baseline_days_active}/7 active days]"
+                if baseline_days_active < 7 else "")
+        print(f"7-day avg      {baseline_avg:.1f} puffs/day{hint}  "
+              f"(today {arrow} {abs(delta_pct):.0f}% {word} usual)")
+
+    # Yesterday
+    print(f"Yesterday      {yday_count} puffs")
+    print()
+
+    # Hour pattern
+    print(f"Hour pattern   {sparkline(hours)}   00h → 23h")
+    print()
+
+    # Last puff
+    if last:
+        print(f"Last puff      {fmt_ago(last[1])}  (#{last[0]}, {last[2] / 1000:.1f}s)")
+    else:
+        print("Last puff      never")
+
+    # Current pod
+    if last and last[3]:
+        opened = (dt.datetime.fromtimestamp(pod_opened_ts).astimezone()
+                  .strftime("%Y-%m-%d %H:%M"))
+        print(f"Current pod    {last[3]}  ·  opened {opened}  ·  "
+              f"{current_pod_puffs} puffs in")
+
+    return 0
+
+
 def cmd_calibrate(args: argparse.Namespace) -> int:
     """Run discovery and (over)write the target UUID in config.toml."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -701,6 +852,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     sub.add_parser("calibrate",
                    help=f"discover target device and save UUID to {CONFIG_PATH}")
+    sub.add_parser("analyze",
+                   help="daily-glance summary: today vs 7-day baseline, "
+                        "hour pattern, last puff, current pod")
     sub.add_parser("status", help="show last-known state (DB read)")
     sub.add_parser("doctor", help="diagnose common BT stuck states")
 
@@ -716,6 +870,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     dispatch = {
         "watch":     cmd_watch,
         "calibrate": cmd_calibrate,
+        "analyze":   cmd_analyze,
         "status":    cmd_status,
         "puffs":     cmd_puffs,
         "export":    cmd_export,
